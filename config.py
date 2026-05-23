@@ -1,7 +1,8 @@
 # ─── Audio ────────────────────────────────────────────────────────────────────
-MIC_DEVICE  = None      # None = auto-detect; or set to device index from: python3 -m sounddevice
-SAMPLE_RATE = 16000     # Whisper.cpp requires 16 kHz — do not change
-CHANNELS    = 1         # Mono
+MIC_DEVICE   = None     # None = auto-detect; set to device index if wrong device picked
+                        # Run: python3 -m sounddevice   to list devices
+SAMPLE_RATE  = 16000    # Target rate for Whisper — code will resample if mic differs
+CHANNELS     = 1        # Mono
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
 WHISPER_PATH  = "/home/zoro/Applications/whisper.cpp/build/bin/main"
