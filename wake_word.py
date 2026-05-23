@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Rocky AI Buddy — Wake Word Detection
-Uses sounddevice (not pyaudio) to avoid Pi 5 segfault.
+Records at the device's native rate, resamples to 16 kHz, feeds Whisper.
 """
 
 import os
@@ -17,37 +17,8 @@ import sounddevice as sd
 from config import (
     CHANNELS, SAMPLE_RATE, WAKE_WORD, WAKE_WORD_VARIATIONS,
     WHISPER_PATH, WHISPER_MODEL, RECORDINGS_DIR, WAKE_CHUNK_SECONDS,
-    MIC_DEVICE,
 )
-
-
-def pick_input_device() -> int | None:
-    """
-    Return the sounddevice index for the best input device.
-    Prefers USB/IEM by name; falls back to default.
-    Run `python3 -m sounddevice` to list devices.
-    """
-    if MIC_DEVICE is not None:
-        return MIC_DEVICE
-
-    devices = sd.query_devices()
-    best    = None
-
-    for i, dev in enumerate(devices):
-        if dev["max_input_channels"] < 1:
-            continue
-        name = dev["name"].lower()
-        if any(k in name for k in ("usb", "iem", "headset", "c-media", "uac")):
-            best = i
-            break
-        if best is None:
-            best = i   # first available input as fallback
-
-    if best is not None:
-        print(f"🎙️  Input device [{best}]: {sd.query_devices(best)['name']}")
-    else:
-        print("🎙️  Using system default input device")
-    return best
+from audio_utils import pick_input_device, get_native_rate, record_seconds, save_wav
 
 
 class WakeWordDetector:
@@ -55,7 +26,9 @@ class WakeWordDetector:
         self.callback = callback
         self.running  = False
         self._thread  = None
-        self._dev     = pick_input_device()
+
+        self._dev         = pick_input_device()
+        self._native_rate = get_native_rate(self._dev)
 
         self._tmp = Path(RECORDINGS_DIR) / "ww_tmp"
         self._tmp.mkdir(parents=True, exist_ok=True)
@@ -65,22 +38,10 @@ class WakeWordDetector:
     # ── recording ─────────────────────────────────────────────────────────────
 
     def _record_chunk(self) -> Path | None:
-        """Capture WAKE_CHUNK_SECONDS of audio; return path to .wav."""
         try:
-            frames = sd.rec(
-                int(SAMPLE_RATE * WAKE_CHUNK_SECONDS),
-                samplerate=SAMPLE_RATE,
-                channels=CHANNELS,
-                dtype="int16",
-                device=self._dev,
-                blocking=True,
-            )
-            wav = self._tmp / f"ww_{int(time.time()*1000)}.wav"
-            with wave.open(str(wav), "wb") as wf:
-                wf.setnchannels(CHANNELS)
-                wf.setsampwidth(2)          # int16 = 2 bytes
-                wf.setframerate(SAMPLE_RATE)
-                wf.writeframes(frames.tobytes())
+            frames = record_seconds(WAKE_CHUNK_SECONDS, self._dev, self._native_rate)
+            wav    = self._tmp / f"ww_{int(time.time()*1000)}.wav"
+            save_wav(str(wav), frames)
             return wav
         except Exception as e:
             print(f"⚠️  Wake chunk record error: {e}")
@@ -115,13 +76,11 @@ class WakeWordDetector:
             txt.unlink(missing_ok=True)
         return ""
 
-    # ── wake word check ───────────────────────────────────────────────────────
+    # ── detection ─────────────────────────────────────────────────────────────
 
     @staticmethod
     def _has_wake_word(text: str) -> bool:
         return any(v in text for v in WAKE_WORD_VARIATIONS)
-
-    # ── main loop ─────────────────────────────────────────────────────────────
 
     def _loop(self):
         print("👂 Wake-word loop running …")

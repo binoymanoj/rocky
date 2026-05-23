@@ -4,7 +4,7 @@ Rocky AI Buddy — Main Application
 
 Controls:
   Say "Hey Rocky"      → voice trigger
-  Press Enter          → manual trigger: records your voice
+  Press Enter          → manual voice recording trigger
   Type text + Enter    → skip recording, send text straight to LLM
   Ctrl-C               → quit
 """
@@ -26,9 +26,9 @@ from config import (
     WHISPER_PATH, WHISPER_MODEL, PIPER_VOICE,
     OLLAMA_MODEL, OLLAMA_URL, OLLAMA_SYSTEM_PROMPT,
     WAKE_WORD, RECORD_SECONDS, MAX_SAVED_AUDIO,
-    MIC_DEVICE,
 )
-from wake_word import WakeWordDetector, pick_input_device
+from audio_utils import pick_input_device, get_native_rate, record_seconds, save_wav
+from wake_word import WakeWordDetector
 from display import FaceDisplay, EmotionState
 
 
@@ -37,8 +37,9 @@ class RockyAI:
         self.running           = False
         self._interaction_lock = threading.Lock()
 
-        # Audio device (sounddevice — no PyAudio, no segfault)
-        self._dev = pick_input_device()
+        # Shared audio device + native rate
+        self._dev         = pick_input_device()
+        self._native_rate = get_native_rate(self._dev)
 
         # Sub-systems
         self.display       = FaceDisplay()
@@ -59,7 +60,7 @@ class RockyAI:
     def _run_interaction(self, typed_text: str | None = None):
         """listen → transcribe → LLM → speak"""
         if not self._interaction_lock.acquire(blocking=False):
-            print("⚠️  Already in an interaction — ignoring trigger")
+            print("⚠️  Already responding — ignoring trigger")
             return
         try:
             self.display.set_emotion(EmotionState.LISTENING)
@@ -74,7 +75,7 @@ class RockyAI:
                 self.display.set_emotion(EmotionState.THINKING)
                 text = self._transcribe(audio_file)
                 if not text:
-                    print("⚠️  Could not understand speech — try again")
+                    print("⚠️  Could not understand — please try again")
                     return
 
             print(f"📝 You: {text}")
@@ -96,25 +97,14 @@ class RockyAI:
             self.display.set_emotion(EmotionState.IDLE)
             self._interaction_lock.release()
 
-    # ── audio recording (sounddevice) ─────────────────────────────────────────
+    # ── audio recording ───────────────────────────────────────────────────────
 
     def _record_audio(self) -> str | None:
         print(f"🎤 Recording {RECORD_SECONDS} s …")
         path = f"{RECORDINGS_DIR}/rec_{int(time.time())}.wav"
         try:
-            frames = sd.rec(
-                int(SAMPLE_RATE * RECORD_SECONDS),
-                samplerate=SAMPLE_RATE,
-                channels=CHANNELS,
-                dtype="int16",
-                device=self._dev,
-                blocking=True,
-            )
-            with wave.open(path, "wb") as wf:
-                wf.setnchannels(CHANNELS)
-                wf.setsampwidth(2)
-                wf.setframerate(SAMPLE_RATE)
-                wf.writeframes(frames.tobytes())
+            frames = record_seconds(RECORD_SECONDS, self._dev, self._native_rate)
+            save_wav(path, frames)
             print(f"✅ Saved → {path}")
             return path
         except Exception as e:
@@ -175,7 +165,6 @@ class RockyAI:
     def _speak(self, text: str):
         path = f"{RESPONSES_DIR}/resp_{int(time.time())}.wav"
         try:
-            # Safe: text via stdin, not shell interpolation
             proc = subprocess.run(
                 ["piper", "--model", PIPER_VOICE, "--output_file", path],
                 input=text.encode(),
@@ -193,18 +182,18 @@ class RockyAI:
         finally:
             self._prune(RESPONSES_DIR)
 
-    # ── emotion hint from user words ──────────────────────────────────────────
+    # ── emotion hint ──────────────────────────────────────────────────────────
 
     @staticmethod
     def _detect_emotion(text: str):
         t = text.lower()
-        if any(w in t for w in ("sad","cry","upset","depressed","miss")):
+        if any(w in t for w in ("sad", "cry", "upset", "depressed", "miss")):
             return EmotionState.SAD
-        if any(w in t for w in ("angry","mad","furious","hate")):
+        if any(w in t for w in ("angry", "mad", "furious", "hate")):
             return EmotionState.ANGRY
-        if any(w in t for w in ("happy","great","awesome","love","wonderful","yay")):
+        if any(w in t for w in ("happy", "great", "awesome", "love", "wonderful", "yay")):
             return EmotionState.HAPPY
-        if any(w in t for w in ("wow","amazing","incredible","surprised","whoa")):
+        if any(w in t for w in ("wow", "amazing", "incredible", "surprised", "whoa")):
             return EmotionState.SURPRISED
         return None
 
