@@ -11,6 +11,7 @@ Controls:
 
 import os
 import sys
+import json
 import time
 import signal
 import threading
@@ -203,27 +204,48 @@ class RockyAI:
     # ── Ollama LLM ────────────────────────────────────────────────────────────
 
     def _llm(self, user_text: str) -> str | None:
-        try:
-            resp = requests.post(
-                f"{OLLAMA_URL}/api/chat",
-                json={
-                    "model": OLLAMA_MODEL,
-                    "stream": False,
-                    "messages": [
-                        {"role": "system", "content": OLLAMA_SYSTEM_PROMPT},
-                        {"role": "user",   "content": user_text},
-                    ],
-                    "options": {"temperature": 0.7, "num_predict": 120},
-                },
-                timeout=40,
-            )
-            if resp.status_code == 200:
-                return resp.json()["message"]["content"].strip()
-            print(f"❌ Ollama HTTP {resp.status_code}: {resp.text[:200]}")
-        except requests.exceptions.ConnectionError:
-            print("❌ Cannot reach Ollama — run: ollama serve")
-        except Exception as e:
-            print(f"❌ LLM error: {e}")
+        payload = {
+            "model": OLLAMA_MODEL,
+            "stream": True,          # stream tokens so Pi doesn't hit a flat timeout
+            "messages": [
+                {"role": "system", "content": OLLAMA_SYSTEM_PROMPT},
+                {"role": "user",   "content": user_text},
+            ],
+            "options": {
+                "temperature": 0.7,
+                "num_predict": 120,
+                "keep_alive": "10m",  # keep model warm between calls
+            },
+        }
+        for attempt in range(2):     # retry once — model is often warm on 2nd try
+            try:
+                tokens = []
+                with requests.post(
+                    f"{OLLAMA_URL}/api/chat",
+                    json=payload,
+                    stream=True,
+                    timeout=(10, 90),  # (connect timeout, per-read timeout)
+                ) as resp:
+                    if resp.status_code != 200:
+                        print(f"❌ Ollama HTTP {resp.status_code}: {resp.text[:200]}")
+                        return None
+                    for line in resp.iter_lines():
+                        if not line:
+                            continue
+                        chunk = json.loads(line)
+                        tokens.append(chunk["message"]["content"])
+                        if chunk.get("done"):
+                            break
+                return "".join(tokens).strip() or None
+            except requests.exceptions.ConnectionError:
+                print("❌ Cannot reach Ollama — run: ollama serve")
+                return None
+            except requests.exceptions.Timeout:
+                print(f"⚠️  Ollama timed out (attempt {attempt + 1}/2) — retrying…")
+            except Exception as e:
+                print(f"❌ LLM error: {e}")
+                return None
+        print("❌ Ollama timed out after 2 attempts — try: ollama ps")
         return None
 
     # ── Piper TTS ─────────────────────────────────────────────────────────────
