@@ -1,5 +1,7 @@
-piper-tts>=1.2.0
-pyaudio>=0.2.13
-numpy>=1.24.0
-pillow>=10.0.0
-requests>=2.31.0
+pillow
+requests
+sounddevice
+soundfile
+numpy
+piper-tts
+rich
