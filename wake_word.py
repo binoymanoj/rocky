@@ -1,230 +1,189 @@
 #!/usr/bin/env python3
 """
-Rocky AI Buddy - Wake Word Detection
-Continuously listens for the wake word "Hey Rocky"
+Rocky AI Buddy — Wake Word Detection
+Listens continuously for "Hey Rocky" using Whisper.cpp chunks.
 """
 
 import os
+import sys
 import time
 import wave
-import pyaudio
-import subprocess
 import threading
+import subprocess
 from pathlib import Path
 
-from config import *
+# ── Suppress ALSA / JACK noise before importing pyaudio ──────────────────────
+import ctypes
+_asound = ctypes.cdll.LoadLibrary("libasound.so.2")
+_asound.snd_lib_error_set_handler(ctypes.CFUNCTYPE(None)(lambda: None))
+os.environ.setdefault("JACK_NO_START_SERVER", "1")
+
+import pyaudio
+
+from config import (
+    CHANNELS, SAMPLE_RATE, WAKE_WORD, WAKE_WORD_VARIATIONS,
+    WHISPER_PATH, WHISPER_MODEL, RECORDINGS_DIR, WAKE_CHUNK_SECONDS,
+)
+
+
+def _pick_input_device(pa: pyaudio.PyAudio) -> int | None:
+    """Return index of first USB/IEM mic, falling back to any input device."""
+    usb_index = None
+    fallback   = None
+    for i in range(pa.get_device_count()):
+        info = pa.get_device_info_by_index(i)
+        if info["maxInputChannels"] < 1:
+            continue
+        name = info.get("name", "").lower()
+        if fallback is None:
+            fallback = i
+        if any(k in name for k in ("usb", "iem", "headset", "c-media", "audio")):
+            usb_index = i
+            break
+    idx = usb_index if usb_index is not None else fallback
+    if idx is not None:
+        print(f"🎙️  Using input device [{idx}]: {pa.get_device_info_by_index(idx)['name']}")
+    return idx
 
 
 class WakeWordDetector:
     def __init__(self, callback=None):
-        self.running = False
-        self.callback = callback
-        self.audio = pyaudio.PyAudio()
-        self.thread = None
-        
-        # Create temp directory for wake word detection
-        self.temp_dir = Path(RECORDINGS_DIR) / "wake_word_temp"
-        self.temp_dir.mkdir(parents=True, exist_ok=True)
-        
-        print(f"👂 Wake word detector initialized ('{WAKE_WORD}')")
-    
-    def record_chunk(self, duration=2):
-        """Record a short audio chunk for wake word detection"""
+        self.callback  = callback
+        self.running   = False
+        self._thread   = None
+
+        self._pa       = pyaudio.PyAudio()
+        self._dev_idx  = _pick_input_device(self._pa)
+
+        self._tmp      = Path(RECORDINGS_DIR) / "ww_tmp"
+        self._tmp.mkdir(parents=True, exist_ok=True)
+
+        print(f"👂 Wake-word detector ready  (trigger: '{WAKE_WORD}')")
+
+    # ── Internal ──────────────────────────────────────────────────────────────
+
+    def _record_chunk(self) -> Path | None:
+        """Capture WAKE_CHUNK_SECONDS of audio and return path to .wav file."""
         try:
-            # Find input device
-            device_index = None
-            for i in range(self.audio.get_device_count()):
-                dev_info = self.audio.get_device_info_by_index(i)
-                if dev_info['maxInputChannels'] > 0:
-                    device_index = i
-                    break
-            
-            stream = self.audio.open(
+            stream = self._pa.open(
                 format=pyaudio.paInt16,
                 channels=CHANNELS,
                 rate=SAMPLE_RATE,
                 input=True,
-                input_device_index=device_index,
-                frames_per_buffer=1024
+                input_device_index=self._dev_idx,
+                frames_per_buffer=512,
             )
-            
+            total_frames = int(SAMPLE_RATE / 512 * WAKE_CHUNK_SECONDS)
             frames = []
-            
-            for _ in range(0, int(SAMPLE_RATE / 1024 * duration)):
+            for _ in range(total_frames):
                 if not self.running:
                     break
-                data = stream.read(1024, exception_on_overflow=False)
-                frames.append(data)
-            
+                frames.append(stream.read(512, exception_on_overflow=False))
             stream.stop_stream()
             stream.close()
-            
-            # Save to temporary WAV file
-            temp_file = self.temp_dir / f"chunk_{int(time.time())}.wav"
-            wf = wave.open(str(temp_file), 'wb')
-            wf.setnchannels(CHANNELS)
-            wf.setsampwidth(self.audio.get_sample_size(pyaudio.paInt16))
-            wf.setframerate(SAMPLE_RATE)
-            wf.writeframes(b''.join(frames))
-            wf.close()
-            
-            return temp_file
-            
+
+            wav_path = self._tmp / f"ww_{int(time.time()*1000)}.wav"
+            with wave.open(str(wav_path), "wb") as wf:
+                wf.setnchannels(CHANNELS)
+                wf.setsampwidth(self._pa.get_sample_size(pyaudio.paInt16))
+                wf.setframerate(SAMPLE_RATE)
+                wf.writeframes(b"".join(frames))
+            return wav_path
         except Exception as e:
-            print(f"❌ Wake word recording error: {e}")
+            print(f"⚠️  Wake chunk record error: {e}")
             return None
-    
-    def transcribe_chunk(self, audio_file):
-        """Quickly transcribe audio chunk with Whisper"""
+
+    def _transcribe(self, wav: Path) -> str:
+        """Run Whisper on wav; return lowercase transcript."""
+        txt = wav.with_suffix(".txt")
         try:
-            cmd = [
-                WHISPER_PATH,
-                "-m", WHISPER_MODEL,
-                "-f", str(audio_file),
-                "--no-timestamps",
-                "--output-txt",
-                "-t", "2"  # Use 2 threads for faster processing
-            ]
-            
-            result = subprocess.run(
-                cmd,
+            subprocess.run(
+                [
+                    WHISPER_PATH, "-m", WHISPER_MODEL,
+                    "-f", str(wav),
+                    "--no-timestamps", "--output-txt",
+                    "-t", "2",       # 2 threads — light touch on Pi
+                    "--language", "en",
+                ],
                 capture_output=True,
-                text=True,
-                timeout=10
+                timeout=12,
             )
-            
-            # Read the generated .txt file
-            txt_file = str(audio_file).replace('.wav', '.txt')
-            if os.path.exists(txt_file):
-                with open(txt_file, 'r') as f:
-                    text = f.read().strip().lower()
-                os.remove(txt_file)  # Clean up
-                return text
-            
-            return ""
-            
+            if txt.exists():
+                result = txt.read_text().strip().lower()
+                txt.unlink(missing_ok=True)
+                return result
+        except subprocess.TimeoutExpired:
+            print("⚠️  Whisper timed out")
         except Exception as e:
-            print(f"❌ Wake word transcription error: {e}")
-            return ""
+            print(f"⚠️  Whisper error: {e}")
         finally:
-            # Clean up audio file
-            if audio_file.exists():
-                audio_file.unlink()
-    
-    def check_wake_word(self, text):
-        """Check if wake word is present in transcribed text"""
-        # Normalize text
-        text = text.lower().strip()
-        wake_word = WAKE_WORD.lower()
-        
-        # Check for exact match or close variations
-        if wake_word in text:
-            return True
-        
-        # Check for common variations
-        variations = [
-            "hey rocky",
-            "hey rockie",
-            "a rocky",
-            "hey rockey",
-            "hey rocket"
-        ]
-        
-        for variant in variations:
-            if variant in text:
-                return True
-        
-        return False
-    
-    def detection_loop(self):
-        """Main loop for wake word detection"""
-        print("👂 Wake word detection started")
-        
-        consecutive_errors = 0
-        
+            wav.unlink(missing_ok=True)
+            txt.unlink(missing_ok=True)
+        return ""
+
+    @staticmethod
+    def _has_wake_word(text: str) -> bool:
+        return any(v in text for v in WAKE_WORD_VARIATIONS)
+
+    def _loop(self):
+        print("👂 Wake-word loop running …")
+        errors = 0
         while self.running:
             try:
-                # Record a chunk
-                audio_file = self.record_chunk(duration=2)
-                
-                if audio_file and self.running:
-                    # Transcribe the chunk
-                    text = self.transcribe_chunk(audio_file)
-                    
-                    # Check for wake word
-                    if text and self.check_wake_word(text):
-                        print(f"✅ Wake word detected! (heard: '{text}')")
-                        
+                wav  = self._record_chunk()
+                if wav and self.running:
+                    text = self._transcribe(wav)
+                    if text:
+                        print(f"   heard: {text!r}")
+                    if text and self._has_wake_word(text):
+                        print(f"✅ Wake word detected!")
                         if self.callback:
-                            # Run callback in separate thread to not block detection
-                            callback_thread = threading.Thread(
-                                target=self.callback,
-                                daemon=True
-                            )
-                            callback_thread.start()
-                            
-                            # Wait for callback to complete before resuming detection
-                            callback_thread.join()
-                    
-                    consecutive_errors = 0
-                
-                # Small delay to prevent excessive CPU usage
-                time.sleep(0.1)
-                
+                            t = threading.Thread(target=self.callback, daemon=True)
+                            t.start()
+                            t.join()           # pause detection while responding
+                errors = 0
             except Exception as e:
-                consecutive_errors += 1
-                print(f"⚠️ Detection loop error: {e}")
-                
-                # If too many consecutive errors, pause longer
-                if consecutive_errors > 5:
-                    print("⚠️ Too many errors, pausing detection...")
-                    time.sleep(5)
-                    consecutive_errors = 0
-        
-        print("🛑 Wake word detection stopped")
-    
+                errors += 1
+                print(f"⚠️  Loop error ({errors}): {e}")
+                if errors > 5:
+                    print("⚠️  Too many errors — sleeping 10 s")
+                    time.sleep(10)
+                    errors = 0
+        print("🛑 Wake-word loop stopped")
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
     def start(self):
-        """Start wake word detection in background thread"""
         if not self.running:
-            self.running = True
-            self.thread = threading.Thread(target=self.detection_loop, daemon=True)
-            self.thread.start()
-            print("✅ Wake word detection thread started")
-    
+            self.running  = True
+            self._thread  = threading.Thread(target=self._loop, daemon=True)
+            self._thread.start()
+            print("✅ Wake-word detection started")
+
     def stop(self):
-        """Stop wake word detection"""
         self.running = False
-        if self.thread:
-            self.thread.join(timeout=5)
-        
-        # Clean up temp directory
-        try:
-            for file in self.temp_dir.glob("*.wav"):
-                file.unlink()
-            for file in self.temp_dir.glob("*.txt"):
-                file.unlink()
-        except Exception as e:
-            print(f"⚠️ Cleanup error: {e}")
-        
-        print("✅ Wake word detector stopped")
+        if self._thread:
+            self._thread.join(timeout=8)
+        self._pa.terminate()
+        # Clean temp dir
+        for f in self._tmp.glob("*.wav"):
+            f.unlink(missing_ok=True)
+        for f in self._tmp.glob("*.txt"):
+            f.unlink(missing_ok=True)
+        print("✅ Wake-word detector stopped")
 
 
-# Test wake word detector
+# ── Standalone test ───────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    def test_callback():
-        print("\n🎉 WAKE WORD CALLBACK TRIGGERED!\n")
-        time.sleep(2)
-    
-    detector = WakeWordDetector(callback=test_callback)
-    
-    print(f"\nListening for '{WAKE_WORD}'...")
-    print("Press Ctrl+C to stop\n")
-    
-    detector.start()
-    
+    def _cb():
+        print("\n🎉 CALLBACK FIRED!\n")
+        time.sleep(1)
+
+    det = WakeWordDetector(callback=_cb)
+    print(f"Listening for '{WAKE_WORD}' — Ctrl-C to quit\n")
+    det.start()
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        print("\n\nStopping detector...")
-        detector.stop()
+        det.stop()

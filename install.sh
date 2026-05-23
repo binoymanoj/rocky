@@ -3,7 +3,8 @@ set -e
 
 echo "🤖 Installing Rocky AI Bot..."
 
-# System dependencies
+# ── System dependencies ────────────────────────────────────────────────────────
+sudo apt update
 sudo apt install -y \
     git curl wget build-essential cmake \
     python3 python3-pip python3-venv \
@@ -13,49 +14,60 @@ sudo apt install -y \
     pipewire pipewire-pulse wireplumber \
     alsa-utils
 
-# Ollama
+# ── Ollama ─────────────────────────────────────────────────────────────────────
 echo "📦 Installing Ollama..."
 curl -fsSL https://ollama.com/install.sh | sh
 sudo systemctl enable ollama
 sudo systemctl start ollama
-
-# Pull model (wait for Ollama to start)
-sleep 5
+sleep 6
 ollama pull gemma3:4b
 
-# Whisper.cpp
+# ── Whisper.cpp ────────────────────────────────────────────────────────────────
 echo "🎤 Building Whisper.cpp..."
 mkdir -p ~/Applications
 cd ~/Applications
-git clone https://github.com/ggml-org/whisper.cpp
+if [ ! -d whisper.cpp ]; then
+    git clone https://github.com/ggml-org/whisper.cpp
+fi
 cd whisper.cpp
 cmake -B build
-cmake --build build -j4
+cmake --build build -j$(nproc)
 bash ./models/download-ggml-model.sh base.en
 
-# Python environment
+# ── Python environment ─────────────────────────────────────────────────────────
 echo "🐍 Setting up Python environment..."
 cd ~/rocky
 python3 -m venv venv
 source venv/bin/activate
 pip install --upgrade pip
-pip install piper-tts pyaudio numpy pillow
-pip install -r requiremets.txt
 
-# Create directories
-mkdir -p voices recordings responses models
+# Note: correct filename is requirements.txt (was typo 'requiremets.txt' in original)
+pip install -r requirements.txt
+pip install pyaudio
 
-# Download Piper voice
-echo "🔊 Downloading TTS voice..."
-cd voices
-wget https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/arctic/medium/en_US-arctic-medium.onnx
-wget https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/arctic/medium/en_US-arctic-medium.onnx.json
+# ── Directories ────────────────────────────────────────────────────────────────
+mkdir -p voices recordings responses
 
+# ── Piper voice ────────────────────────────────────────────────────────────────
+echo "🔊 Downloading Piper voice..."
+cd ~/rocky/voices
+BASE="https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/arctic/medium"
+wget -nc "$BASE/en_US-arctic-medium.onnx"
+wget -nc "$BASE/en_US-arctic-medium.onnx.json"
+
+# ── Add user to video group for framebuffer access ─────────────────────────────
+sudo usermod -aG video "$USER"
+echo "ℹ️  Added $USER to 'video' group (log out & back in for display to work)"
+
+echo ""
 echo "✅ Installation complete!"
+echo ""
 echo "Next steps:"
-echo "1. Test microphone: arecord -D plughw:CARD,DEV -f S16_LE -r 16000 -c 1 test.wav"
-echo "2. Configure rocky.service"
-echo "3. sudo cp ~/rocky/rocky.service /etc/systemd/system/"
-echo "4. sudo systemctl daemon-reload"
-echo "5. sudo systemctl start rocky.service"
-echo "6. sudo systemctl enable rocky.service"
+echo "  1. Test mic:    arecord -D plughw:0,0 -f S16_LE -r 16000 -c 1 -d 5 test.wav && aplay test.wav"
+echo "  2. Find device: arecord -l   (update MIC_DEVICE in config.py if needed)"
+echo "  3. Run Rocky:   source venv/bin/activate && python3 app.py"
+echo "  4. For autostart:"
+echo "     sudo cp ~/rocky/rocky.service /etc/systemd/system/"
+echo "     sudo systemctl daemon-reload"
+echo "     sudo systemctl enable rocky.service"
+echo "     sudo systemctl start rocky.service"
