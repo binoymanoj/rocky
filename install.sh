@@ -8,7 +8,7 @@ sudo apt install -y \
     git curl wget build-essential cmake \
     python3 python3-pip python3-venv \
     ffmpeg portaudio19-dev \
-    libatlas-base-dev \
+    libopenblas-dev \
     espeak-ng \
     pipewire pipewire-pulse wireplumber \
     alsa-utils
