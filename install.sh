@@ -21,7 +21,7 @@ sudo systemctl start ollama
 
 # Pull model (wait for Ollama to start)
 sleep 5
-ollama pull gemma2:2b
+ollama pull gemma3:4b
 
 # Whisper.cpp
 echo "🎤 Building Whisper.cpp..."
@@ -40,6 +40,7 @@ python3 -m venv venv
 source venv/bin/activate
 pip install --upgrade pip
 pip install piper-tts pyaudio numpy pillow
+pip install -r requiremets.txt
 
 # Create directories
 mkdir -p voices recordings responses models
