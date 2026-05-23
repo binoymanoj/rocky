@@ -21,21 +21,29 @@ OLLAMA_SYSTEM_PROMPT = (
     "Keep every reply to 1-3 short sentences. Be warm and helpful."
 )
 
+# How long Ollama keeps the model loaded in RAM between calls.
+# "-1" = forever (never unload). Keeps responses fast after first load.
+OLLAMA_KEEP_ALIVE = "-1"
+
 # ─── Wake Word ────────────────────────────────────────────────────────────────
 WAKE_WORD = "hey rocky"
 WAKE_WORD_VARIATIONS = [
     "hey rocky", "hey rockie", "hey rockey",
     "hey rocket", "a rocky", "hi rocky",
+    "rocky", "okay rocky", "ok rocky",
 ]
 
 # ─── Recording ────────────────────────────────────────────────────────────────
 RECORD_SECONDS     = 6    # how long to record after wake word
-WAKE_CHUNK_SECONDS = 3    # audio chunk length for wake-word loop
+WAKE_CHUNK_SECONDS = 2    # shorter chunks = faster wake word response
 
 # ─── Display ──────────────────────────────────────────────────────────────────
 DISPLAY_WIDTH  = 480
 DISPLAY_HEIGHT = 320
-TARGET_FPS     = 20
+
+# Set to 0 for e-ink / 0fps screens — face only redraws when emotion changes.
+# Set to a number like 10 for animated screens.
+TARGET_FPS     = 0
 
 # ─── Misc ─────────────────────────────────────────────────────────────────────
 MAX_SAVED_AUDIO = 10

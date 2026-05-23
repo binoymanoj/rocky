@@ -1,60 +1,82 @@
 #!/usr/bin/env python3
 """
-Rocky AI Buddy — Animated Face Display
+Rocky AI Buddy — Face Display
 
-Renders to /dev/fb0 (Raspberry Pi framebuffer) when available,
-otherwise saves frames to /tmp/rocky_frame.png for debugging.
+Designed for 0fps / e-ink style screens: only redraws when emotion changes.
+If TARGET_FPS > 0, also animates the speaking mouth open/close.
+
+Face style: rounded-square (squircle) eyes, small curved mouth,
+rich emotion set with tears, angry pupils, thinking dots, etc.
 """
 
 import os
-import sys
-import time
 import math
 import struct
 import threading
+import time
 from enum import Enum
 from pathlib import Path
 
 try:
-    from PIL import Image, ImageDraw
+    from PIL import Image, ImageDraw, ImageFilter
 except ImportError:
     os.system("pip install pillow")
-    from PIL import Image, ImageDraw
+    from PIL import Image, ImageDraw, ImageFilter
 
 from config import DISPLAY_WIDTH, DISPLAY_HEIGHT, TARGET_FPS
 
 FRAMEBUFFER = "/dev/fb0"
+
+# ── Palette ───────────────────────────────────────────────────────────────────
+BG          = (10,  12,  28)     # deep navy
+EYE_WHITE   = (230, 235, 255)    # cool white iris
+EYE_FILL    = (18,  20,  45)     # squircle fill (dark inner)
+PUPIL_COL   = (15,  15,  30)     # near-black pupil
+BROW_COL    = (200, 210, 255)    # eyebrow
+MOUTH_COL   = (200, 210, 255)    # neutral mouth
+TEAR_COL    = (100, 160, 255)    # tear drop blue
+SHINE       = (240, 245, 255)    # eye shine / catchlight
+
+ACCENT = {
+    "idle":      (90,  160, 255),
+    "listening": (60,  230, 160),
+    "thinking":  (255, 200,  60),
+    "loading":   (255, 160,  40),
+    "speaking":  (60,  200, 255),
+    "happy":     (80,  240, 110),
+    "sad":       (90,  110, 210),
+    "angry":     (255,  60,  60),
+    "surprised": (255, 190,  40),
+    "scared":    (200,  80, 220),
+}
 
 
 class EmotionState(Enum):
     IDLE      = "idle"
     LISTENING = "listening"
     THINKING  = "thinking"
+    LOADING   = "loading"
     SPEAKING  = "speaking"
     HAPPY     = "happy"
     SAD       = "sad"
     ANGRY     = "angry"
     SURPRISED = "surprised"
+    SCARED    = "scared"
 
 
-# ─── colour palette ───────────────────────────────────────────────────────────
-BG      = (10,  10,  25)    # dark navy
-EYE_FG  = (255, 255, 255)   # white iris / brows
-PUPIL   = (30,  30,  30)    # near-black pupil
-MOUTH   = (255, 255, 255)
-SCLERA  = (20,  20,  40)    # eye-ball fill
+# ── Squircle helper ───────────────────────────────────────────────────────────
 
-# Emotion accent colours
-ACCENT  = {
-    EmotionState.IDLE:      (100, 180, 255),
-    EmotionState.LISTENING: (100, 255, 180),
-    EmotionState.THINKING:  (255, 220, 80),
-    EmotionState.SPEAKING:  (80,  200, 255),
-    EmotionState.HAPPY:     (100, 255, 100),
-    EmotionState.SAD:       (100, 120, 200),
-    EmotionState.ANGRY:     (255,  80,  80),
-    EmotionState.SURPRISED: (255, 200,  50),
-}
+def squircle_points(cx, cy, w, h, n=60):
+    """Generate polygon points approximating a squircle (superellipse n=4)."""
+    pts = []
+    for i in range(n):
+        t   = 2 * math.pi * i / n
+        cos = math.cos(t)
+        sin = math.sin(t)
+        x   = cx + w * math.copysign(abs(cos) ** 0.5, cos)
+        y   = cy + h * math.copysign(abs(sin) ** 0.5, sin)
+        pts.append((x, y))
+    return pts
 
 
 class FaceDisplay:
@@ -63,229 +85,361 @@ class FaceDisplay:
         self.h   = DISPLAY_HEIGHT
         self.fps = TARGET_FPS
 
-        self.running         = False
-        self.emotion         = EmotionState.IDLE
-        self._emotion_lock   = threading.Lock()
+        self.running       = False
+        self._emotion      = EmotionState.IDLE
+        self._prev_emotion = None          # track changes for 0fps mode
+        self._lock         = threading.Lock()
 
-        # Animation state
-        self.frame       = 0
-        self.blink       = False
-        self.blink_frame = 0
-        self.speak_phase = 0.0
+        # Animation counters (only matter when fps > 0)
+        self._frame      = 0
+        self._speak_open = False           # toggle for speaking mouth
 
-        # Eye geometry
-        self.eye_r   = 65
-        self.pupil_r = 22
-        self.eye_y   = self.h // 2 - 25
-        self.eye_lx  = self.w // 2 - 90
-        self.eye_rx  = self.w // 2 + 90
-        self.mouth_y = self.h // 2 + 70
+        # Eye layout
+        self._ew   = 88    # eye squircle half-width
+        self._eh   = 72    # eye squircle half-height
+        self._ey   = self.h // 2 - 20
+        self._elx  = self.w // 2 - 100
+        self._erx  = self.w // 2 + 100
+        self._my   = self.h // 2 + 88     # mouth centre y
+        self._pr   = 20                    # pupil radius
 
-        # Framebuffer detection
-        self._use_fb  = os.path.exists(FRAMEBUFFER)
-        self._fb_info = None
+        # Framebuffer
+        self._use_fb = os.path.exists(FRAMEBUFFER)
         if self._use_fb:
             try:
-                self._fb_info = self._detect_fb()
-                print(f"🖥️  Framebuffer: {FRAMEBUFFER}  ({self._fb_info})")
-            except Exception as e:
-                print(f"⚠️  FB detect failed: {e} — using file output")
-                self._use_fb = False
+                vsize = Path("/sys/class/graphics/fb0/virtual_size").read_text().strip()
+                print(f"🖥️  Framebuffer {FRAMEBUFFER}  ({vsize})")
+            except Exception:
+                print(f"🖥️  Framebuffer {FRAMEBUFFER}")
         else:
-            print(f"🖥️  No {FRAMEBUFFER} — saving frames to /tmp/rocky_frame.png")
+            print(f"🖥️  No {FRAMEBUFFER} — frames → /tmp/rocky_frame.png")
 
-        print(f"🖥️  Display initialised ({self.w}×{self.h} @ {self.fps} fps)")
+        mode = f"{self.fps} fps" if self.fps > 0 else "static/0fps"
+        print(f"🖥️  Display ready  {self.w}×{self.h}  {mode}")
 
-    # ── Public ────────────────────────────────────────────────────────────────
+    # ── Public API ────────────────────────────────────────────────────────────
 
     def set_emotion(self, e: EmotionState):
-        with self._emotion_lock:
-            self.emotion = e
+        with self._lock:
+            self._emotion = e
         print(f"😊 Emotion → {e.value}")
+        # In 0fps mode push a frame immediately on every change
+        if self.fps == 0:
+            self._push_frame(e)
 
     def run(self):
+        """Main loop.  For fps=0 screens this just idles; frames pushed by set_emotion."""
         self.running = True
-        interval = 1.0 / self.fps
         print("🎨 Display loop started")
-        while self.running:
-            t0 = time.monotonic()
-            with self._emotion_lock:
-                em = self.emotion
-            self._update(em)
-            img = self._render(em)
-            self._output(img)
-            elapsed = time.monotonic() - t0
-            time.sleep(max(0.0, interval - elapsed))
+
+        if self.fps == 0:
+            # Draw the initial idle face once, then sit idle
+            self._push_frame(EmotionState.IDLE)
+            while self.running:
+                time.sleep(0.5)
+        else:
+            interval = 1.0 / self.fps
+            while self.running:
+                t0 = time.monotonic()
+                with self._lock:
+                    em = self._emotion
+                self._frame += 1
+
+                # Speaking mouth toggle at ~2 Hz
+                if em == EmotionState.SPEAKING and self._frame % max(1, self.fps // 2) == 0:
+                    self._speak_open = not self._speak_open
+
+                img = self._render(em)
+                self._output(img)
+                elapsed = time.monotonic() - t0
+                time.sleep(max(0.0, interval - elapsed))
+
         print("🛑 Display loop stopped")
 
     def stop(self):
         self.running = False
 
-    # ── Animation state ───────────────────────────────────────────────────────
+    # ── Frame pipeline ────────────────────────────────────────────────────────
 
-    def _update(self, em: EmotionState):
-        self.frame += 1
-
-        # Blink every ~3 s
-        if self.frame % (self.fps * 3) == 0:
-            self.blink = True
-            self.blink_frame = 0
-        if self.blink:
-            self.blink_frame += 1
-            if self.blink_frame > 5:
-                self.blink = False
-
+    def _push_frame(self, em: EmotionState):
+        """Render and output a single static frame (used in 0fps mode)."""
+        # For speaking, alternate open/close on each call
         if em == EmotionState.SPEAKING:
-            self.speak_phase += 0.35
-
-    def _pupil_offset(self, em: EmotionState):
-        """Return (dx, dy) normalised pupil offset for each emotion."""
-        f = self.frame
-        if em == EmotionState.IDLE:
-            return (0.3 * math.sin(f * 0.018),  0.2 * math.cos(f * 0.025))
-        if em == EmotionState.THINKING:
-            return (-0.5 + 0.15 * math.sin(f * 0.04), -0.55)
-        if em == EmotionState.HAPPY:
-            return (0.0, -0.25)
-        if em == EmotionState.SAD:
-            return (0.0,  0.35)
-        if em == EmotionState.ANGRY:
-            return (0.0,  0.15)
-        if em == EmotionState.SURPRISED:
-            return (0.0, -0.1)
-        return (0.0, 0.0)
-
-    def _eye_scale(self, em: EmotionState) -> float:
-        return {
-            EmotionState.LISTENING: 1.10,
-            EmotionState.SURPRISED: 1.25,
-            EmotionState.ANGRY:     0.80,
-            EmotionState.SAD:       0.88,
-            EmotionState.HAPPY:     1.05,
-        }.get(em, 1.0)
+            self._speak_open = not self._speak_open
+        img = self._render(em)
+        self._output(img)
 
     # ── Rendering ─────────────────────────────────────────────────────────────
 
     def _render(self, em: EmotionState) -> Image.Image:
         img  = Image.new("RGB", (self.w, self.h), BG)
         draw = ImageDraw.Draw(img)
-        acc  = ACCENT[em]
+        acc  = ACCENT[em.value]
+        ev   = em.value
 
-        scale  = self._eye_scale(em)
-        er     = int(self.eye_r * scale)
-        pr     = int(self.pupil_r * scale)
-        dx, dy = self._pupil_offset(em)
-
-        # Subtle glow ring around each eye (accent colour)
-        for ex in (self.eye_lx, self.eye_rx):
-            draw.ellipse(
-                [ex-er-4, self.eye_y-er-4, ex+er+4, self.eye_y+er+4],
-                outline=acc, width=2
-            )
+        # Glow ring (accent outline around each eye box)
+        for ex in (self._elx, self._erx):
+            pts = squircle_points(ex, self._ey, self._ew + 6, self._eh + 6)
+            draw.polygon(pts, outline=acc)
 
         # Eyes
-        for ex in (self.eye_lx, self.eye_rx):
-            self._draw_eye(draw, ex, self.eye_y, er, pr, dx, dy, em)
+        for ex in (self._elx, self._erx):
+            self._draw_eye(draw, ex, self._ey, em, acc)
 
-        # Brows
-        self._draw_brows(draw, em, er)
+        # Eyebrows
+        self._draw_brows(draw, em)
 
         # Mouth
         self._draw_mouth(draw, em, acc)
 
-        # Emotion label (small, bottom-right)
-        # skipped to keep display clean
+        # Tears for SAD / SCARED
+        if ev in ("sad", "scared"):
+            self._draw_tears(draw, acc)
+
+        # Angry red pupils (veins) overlay
+        if ev == "angry":
+            self._draw_anger_marks(draw)
 
         return img
 
-    def _draw_eye(self, draw, cx, cy, er, pr, dx, dy, em):
-        # Sclera
-        draw.ellipse([cx-er, cy-er, cx+er, cy+er], fill=SCLERA, outline=EYE_FG, width=3)
+    # ── Eye ───────────────────────────────────────────────────────────────────
 
-        if self.blink:
-            # Closed — draw horizontal line
-            draw.line([cx-er, cy, cx+er, cy], fill=EYE_FG, width=5)
-            return
+    def _draw_eye(self, draw, cx, cy, em: EmotionState, acc):
+        ev = em.value
+
+        # Scale squircle per emotion
+        scale = {
+            "surprised": 1.25, "listening": 1.12, "scared": 1.20,
+            "angry": 0.78, "sad": 0.85, "happy": 1.05,
+        }.get(ev, 1.0)
+        ew = int(self._ew * scale)
+        eh = int(self._eh * scale)
+
+        # Draw squircle eye body
+        pts = squircle_points(cx, cy, ew, eh)
+        draw.polygon(pts, fill=EYE_FILL, outline=EYE_WHITE)
+
+        # Half-close for SAD / ANGRY (draw filled rect over top half)
+        if ev == "sad":
+            draw.rectangle([cx - ew, cy - eh, cx + ew, cy], fill=BG)
+            # Redraw bottom arc outline
+            pts2 = squircle_points(cx, cy, ew, eh)
+            draw.polygon(pts2, outline=EYE_WHITE)
+        elif ev == "angry":
+            # Cover top-third to make squinting look
+            cover = eh // 3
+            draw.rectangle([cx - ew, cy - eh, cx + ew, cy - eh + cover * 2], fill=BG)
 
         # Pupil
-        px = cx + int(dx * pr)
-        py = cy + int(dy * pr)
-        draw.ellipse([px-pr, py-pr, px+pr, py+pr], fill=PUPIL)
+        pdx, pdy = self._pupil_offset(em)
+        px = int(cx + pdx * self._pr)
+        py = int(cy + pdy * self._pr)
+        pr = self._pr
+        draw.ellipse([px - pr, py - pr, px + pr, py + pr], fill=PUPIL_COL)
 
-        # Catchlight
-        cl = pr // 4
-        draw.ellipse([px-cl+cl, py-cl, px+cl, py], fill=(220, 220, 255))
+        # Shine / catchlight
+        sl = pr // 3
+        draw.ellipse([px - sl + sl, py - sl, px, py], fill=SHINE)
 
-    def _draw_brows(self, draw, em, er):
-        lx, rx = self.eye_lx, self.eye_rx
-        by = self.eye_y - er - 18
-
-        if em == EmotionState.ANGRY:
-            draw.line([(lx-er, by-12), (lx+er//2, by+4)], fill=EYE_FG, width=5)
-            draw.line([(rx-er//2, by+4), (rx+er, by-12)], fill=EYE_FG, width=5)
-        elif em == EmotionState.SAD:
-            draw.line([(lx-er, by+6), (lx+er//2, by-6)], fill=EYE_FG, width=4)
-            draw.line([(rx-er//2, by-6), (rx+er, by+6)], fill=EYE_FG, width=4)
-        elif em == EmotionState.SURPRISED:
-            for ex in (lx, rx):
-                draw.arc([ex-er, by-20, ex+er, by+10], 200, 340, fill=EYE_FG, width=4)
-        else:
-            # Neutral flat brows
-            for ex in (lx, rx):
-                draw.line([(ex-er+6, by), (ex+er-6, by)], fill=EYE_FG, width=3)
-
-    def _draw_mouth(self, draw, em, acc):
-        cx, my = self.w // 2, self.mouth_y
-        w2, h2 = 70, 28
-
-        if em == EmotionState.HAPPY:
-            draw.arc([cx-w2, my-h2, cx+w2, my+h2], 0, 180, fill=acc, width=5)
-
-        elif em == EmotionState.SAD:
-            draw.arc([cx-w2, my-h2//2, cx+w2, my+h2], 180, 360, fill=acc, width=5)
-
-        elif em == EmotionState.ANGRY:
-            draw.line([(cx-w2, my+10), (cx+w2, my+10)], fill=acc, width=5)
-
-        elif em == EmotionState.SURPRISED:
-            draw.ellipse([cx-22, my-22, cx+22, my+22], outline=acc, fill=SCLERA, width=4)
-
-        elif em == EmotionState.SPEAKING:
-            openness = int(abs(math.sin(self.speak_phase)) * 28) + 8
+        # Listening: pulsing ring inside eye
+        if ev == "listening":
+            ring_r = int(ew * 0.55)
             draw.ellipse(
-                [cx-30, my-openness//2, cx+30, my+openness//2],
-                outline=acc, fill=SCLERA, width=4
+                [cx - ring_r, cy - ring_r, cx + ring_r, cy + ring_r],
+                outline=acc, width=2
             )
 
-        elif em == EmotionState.THINKING:
-            # Dots …
-            for i, dx in enumerate((-25, 0, 25)):
-                phase = self.frame * 0.08 + i * 1.0
+        # Thinking: spinning arc inside eye
+        if ev in ("thinking", "loading"):
+            arc_r = int(ew * 0.5)
+            offset = (self._frame * 8) % 360 if self.fps > 0 else 45
+            draw.arc(
+                [cx - arc_r, cy - arc_r, cx + arc_r, cy + arc_r],
+                offset, offset + 240, fill=acc, width=3
+            )
+
+        # Happy: half-moon (upper arc covered — "^" shape eye)
+        if ev == "happy":
+            draw.rectangle([cx - ew, cy, cx + ew, cy + eh + 2], fill=BG)
+
+        # Stars for surprised: tiny dots at corners
+        if ev == "surprised":
+            for sx, sy in [(cx - ew + 8, cy - eh + 8), (cx + ew - 8, cy - eh + 8)]:
+                draw.ellipse([sx - 3, sy - 3, sx + 3, sy + 3], fill=acc)
+
+    def _pupil_offset(self, em: EmotionState):
+        ev = em.value
+        f  = self._frame
+        if ev == "idle":
+            return (0.3 * math.sin(f * 0.05), 0.2 * math.cos(f * 0.07))
+        if ev == "thinking":
+            return (-0.6, -0.5)
+        if ev == "loading":
+            return (0.0, -0.5)
+        if ev == "happy":
+            return (0.0, -0.3)
+        if ev in ("sad", "scared"):
+            return (0.0, 0.4)
+        if ev == "angry":
+            return (0.0, 0.2)
+        if ev == "surprised":
+            return (0.0, 0.0)
+        return (0.0, 0.0)
+
+    # ── Eyebrows ──────────────────────────────────────────────────────────────
+
+    def _draw_brows(self, draw, em: EmotionState):
+        ev = em.value
+        lx, rx = self._elx, self._erx
+        by = self._ey - self._eh - 14
+
+        bw = self._ew - 10   # brow half-width
+
+        if ev == "angry":
+            # V shape — inner corners raised
+            draw.line([(lx - bw, by - 14), (lx + bw, by + 6)], fill=ACCENT["angry"], width=5)
+            draw.line([(rx - bw, by + 6),  (rx + bw, by - 14)], fill=ACCENT["angry"], width=5)
+        elif ev == "sad":
+            # Inverted V — inner corners lowered
+            draw.line([(lx - bw, by + 6),  (lx + bw, by - 10)], fill=BROW_COL, width=4)
+            draw.line([(rx - bw, by - 10), (rx + bw, by + 6)],  fill=BROW_COL, width=4)
+        elif ev == "surprised":
+            # High arched brows
+            for ex in (lx, rx):
+                draw.arc([ex - bw, by - 22, ex + bw, by + 8], 200, 340, fill=BROW_COL, width=4)
+        elif ev == "scared":
+            # High + slanted outward
+            draw.line([(lx - bw, by - 18), (lx + bw, by + 2)], fill=BROW_COL, width=4)
+            draw.line([(rx - bw, by + 2),  (rx + bw, by - 18)], fill=BROW_COL, width=4)
+        elif ev == "happy":
+            # Relaxed slight arch
+            for ex in (lx, rx):
+                draw.arc([ex - bw, by - 10, ex + bw, by + 14], 210, 330, fill=BROW_COL, width=3)
+        else:
+            # Flat neutral
+            for ex in (lx, rx):
+                draw.line([(ex - bw, by), (ex + bw, by)], fill=BROW_COL, width=3)
+
+    # ── Mouth ─────────────────────────────────────────────────────────────────
+
+    def _draw_mouth(self, draw, em: EmotionState, acc):
+        ev = em.value
+        cx = self.w // 2
+        my = self._my
+        mw = 52    # mouth half-width (small)
+        mh = 20    # mouth arc height
+
+        if ev == "happy":
+            # Wide open smile
+            draw.arc([cx - mw, my - mh, cx + mw, my + mh], 0, 180, fill=acc, width=4)
+            # Teeth hint
+            draw.ellipse([cx - mw + 10, my - 4, cx + mw - 10, my + 10],
+                         fill=(240, 240, 240))
+
+        elif ev == "sad":
+            # Downward curve (frown)
+            draw.arc([cx - mw, my - mh // 2, cx + mw, my + mh], 180, 360, fill=acc, width=4)
+
+        elif ev == "angry":
+            # Flat with downward corners — zigzag
+            pts = [
+                (cx - mw, my + 8),
+                (cx - mw // 2, my),
+                (cx, my + 8),
+                (cx + mw // 2, my),
+                (cx + mw, my + 8),
+            ]
+            draw.line(pts, fill=acc, width=4)
+
+        elif ev == "surprised":
+            # Open O mouth
+            draw.ellipse([cx - 20, my - 18, cx + 20, my + 18],
+                         outline=acc, fill=EYE_FILL, width=3)
+
+        elif ev == "scared":
+            # Wavy / trembling mouth
+            pts = []
+            for i in range(21):
+                t  = i / 20
+                x  = cx - mw + int(t * 2 * mw)
+                y  = my + int(8 * math.sin(t * math.pi * 4))
+                pts.append((x, y))
+            draw.line(pts, fill=acc, width=3)
+
+        elif ev == "speaking":
+            # Open/close toggle — open = oval, closed = thin line
+            if self._speak_open:
+                open_h = mh + 10
+                draw.ellipse([cx - mw + 10, my - open_h // 2,
+                               cx + mw - 10, my + open_h // 2],
+                             outline=acc, fill=EYE_FILL, width=3)
+            else:
+                draw.arc([cx - mw, my - 4, cx + mw, my + 4], 0, 180, fill=acc, width=3)
+
+        elif ev == "thinking":
+            # Three animated dots
+            for i, dx in enumerate((-22, 0, 22)):
+                phase = (self._frame * 0.15 + i * 1.2) if self.fps > 0 else (i * 1.2)
                 r = 5 + int(3 * math.sin(phase))
-                draw.ellipse([cx+dx-r, my-r, cx+dx+r, my+r], fill=acc)
+                draw.ellipse([cx + dx - r, my - r, cx + dx + r, my + r], fill=acc)
 
-        elif em == EmotionState.LISTENING:
-            # Pulsing smile
-            p = 0.6 + 0.4 * math.sin(self.frame * 0.12)
-            c = tuple(int(x * p) for x in acc)
-            draw.arc([cx-w2, my-h2//2, cx+w2, my+h2//2], 0, 180, fill=c, width=4)
+        elif ev == "loading":
+            # Spinning arc bar below face
+            offset = (self._frame * 6) % 360 if self.fps > 0 else 0
+            bx, bby = cx, my
+            br = 16
+            draw.arc([bx - br, bby - br, bx + br, bby + br],
+                     offset, offset + 200, fill=acc, width=5)
 
-        else:  # IDLE — gentle neutral smile
-            draw.arc([cx-w2, my-h2//3, cx+w2, my+h2//3], 0, 180, fill=EYE_FG, width=3)
+        elif ev == "listening":
+            # Sound wave bars
+            bar_h = [10, 18, 26, 18, 10]
+            bar_w = 6
+            gap   = 5
+            total = len(bar_h) * (bar_w + gap) - gap
+            bx0   = cx - total // 2
+            for i, bh in enumerate(bar_h):
+                bx = bx0 + i * (bar_w + gap)
+                draw.rectangle(
+                    [bx, my - bh // 2, bx + bar_w, my + bh // 2],
+                    fill=acc
+                )
+
+        else:  # IDLE
+            # Small gentle smile
+            draw.arc([cx - mw, my - mh // 3, cx + mw, my + mh // 3],
+                     0, 180, fill=MOUTH_COL, width=3)
+
+    # ── Tears ─────────────────────────────────────────────────────────────────
+
+    def _draw_tears(self, draw, acc):
+        for ex in (self._elx, self._erx):
+            # Teardrop starting from bottom of eye
+            tx = ex + 10
+            ty = self._ey + self._eh - 10
+            # Elongated teardrop
+            draw.ellipse([tx - 5, ty, tx + 5, ty + 22], fill=TEAR_COL)
+            draw.ellipse([tx - 4, ty - 4, tx + 4, ty + 4], fill=TEAR_COL)
+
+    # ── Anger marks ───────────────────────────────────────────────────────────
+
+    def _draw_anger_marks(self, draw):
+        # Forehead veins / anger marks
+        acc = ACCENT["angry"]
+        cx  = self.w // 2
+        ay  = self._ey - self._eh - 40
+        for side, sx in ((-1, cx - 40), (1, cx + 20)):
+            pts = [
+                (sx, ay),
+                (sx + side * 12, ay - 14),
+                (sx + side * 6,  ay - 22),
+                (sx + side * 18, ay - 30),
+            ]
+            draw.line(pts, fill=acc, width=3)
 
     # ── Output ────────────────────────────────────────────────────────────────
 
-    @staticmethod
-    def _detect_fb() -> str:
-        """Read framebuffer resolution from sysfs."""
-        try:
-            vinfo = Path("/sys/class/graphics/fb0/virtual_size").read_text().strip()
-            return f"virtual_size={vinfo}"
-        except Exception:
-            return "unknown size"
-
     def _img_to_rgb565(self, img: Image.Image) -> bytes:
-        """Convert PIL RGB image to packed RGB565 bytes for /dev/fb0."""
         buf = bytearray()
         for r, g, b in img.getdata():
             pix = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
@@ -299,28 +453,27 @@ class FaceDisplay:
                 with open(FRAMEBUFFER, "wb") as fb:
                     fb.write(data)
             except PermissionError:
-                print("⚠️  No write permission to /dev/fb0 — add user to 'video' group:")
-                print("    sudo usermod -aG video $USER")
+                print("⚠️  No write permission to /dev/fb0")
+                print("    sudo usermod -aG video $USER  then re-login")
                 self._use_fb = False
             except Exception as e:
                 print(f"⚠️  FB write error: {e}")
                 self._use_fb = False
         else:
-            # Debug: save PNG so you can view it
             img.save("/tmp/rocky_frame.png")
 
 
 # ── Standalone test ───────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    import time as _time
     d = FaceDisplay()
     t = threading.Thread(target=d.run, daemon=True)
     t.start()
 
-    emotions = list(EmotionState)
-    for em in emotions:
+    for em in EmotionState:
         print(f"→ {em.value}")
         d.set_emotion(em)
-        time.sleep(2.5)
+        _time.sleep(2.0)
 
     d.stop()
     t.join(timeout=2)
