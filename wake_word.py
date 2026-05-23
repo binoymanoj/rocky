@@ -1,100 +1,94 @@
 #!/usr/bin/env python3
 """
 Rocky AI Buddy — Wake Word Detection
-Listens continuously for "Hey Rocky" using Whisper.cpp chunks.
+Uses sounddevice (not pyaudio) to avoid Pi 5 segfault.
 """
 
 import os
-import sys
 import time
 import wave
 import threading
 import subprocess
 from pathlib import Path
 
-# ── Suppress ALSA / JACK noise before importing pyaudio ──────────────────────
-import ctypes
-_asound = ctypes.cdll.LoadLibrary("libasound.so.2")
-_asound.snd_lib_error_set_handler(ctypes.CFUNCTYPE(None)(lambda: None))
-os.environ.setdefault("JACK_NO_START_SERVER", "1")
-
-import pyaudio
+import numpy as np
+import sounddevice as sd
 
 from config import (
     CHANNELS, SAMPLE_RATE, WAKE_WORD, WAKE_WORD_VARIATIONS,
     WHISPER_PATH, WHISPER_MODEL, RECORDINGS_DIR, WAKE_CHUNK_SECONDS,
+    MIC_DEVICE,
 )
 
 
-def _pick_input_device(pa: pyaudio.PyAudio) -> int | None:
-    """Return index of first USB/IEM mic, falling back to any input device."""
-    usb_index = None
-    fallback   = None
-    for i in range(pa.get_device_count()):
-        info = pa.get_device_info_by_index(i)
-        if info["maxInputChannels"] < 1:
+def pick_input_device() -> int | None:
+    """
+    Return the sounddevice index for the best input device.
+    Prefers USB/IEM by name; falls back to default.
+    Run `python3 -m sounddevice` to list devices.
+    """
+    if MIC_DEVICE is not None:
+        return MIC_DEVICE
+
+    devices = sd.query_devices()
+    best    = None
+
+    for i, dev in enumerate(devices):
+        if dev["max_input_channels"] < 1:
             continue
-        name = info.get("name", "").lower()
-        if fallback is None:
-            fallback = i
-        if any(k in name for k in ("usb", "iem", "headset", "c-media", "audio")):
-            usb_index = i
+        name = dev["name"].lower()
+        if any(k in name for k in ("usb", "iem", "headset", "c-media", "uac")):
+            best = i
             break
-    idx = usb_index if usb_index is not None else fallback
-    if idx is not None:
-        print(f"🎙️  Using input device [{idx}]: {pa.get_device_info_by_index(idx)['name']}")
-    return idx
+        if best is None:
+            best = i   # first available input as fallback
+
+    if best is not None:
+        print(f"🎙️  Input device [{best}]: {sd.query_devices(best)['name']}")
+    else:
+        print("🎙️  Using system default input device")
+    return best
 
 
 class WakeWordDetector:
     def __init__(self, callback=None):
-        self.callback  = callback
-        self.running   = False
-        self._thread   = None
+        self.callback = callback
+        self.running  = False
+        self._thread  = None
+        self._dev     = pick_input_device()
 
-        self._pa       = pyaudio.PyAudio()
-        self._dev_idx  = _pick_input_device(self._pa)
-
-        self._tmp      = Path(RECORDINGS_DIR) / "ww_tmp"
+        self._tmp = Path(RECORDINGS_DIR) / "ww_tmp"
         self._tmp.mkdir(parents=True, exist_ok=True)
 
         print(f"👂 Wake-word detector ready  (trigger: '{WAKE_WORD}')")
 
-    # ── Internal ──────────────────────────────────────────────────────────────
+    # ── recording ─────────────────────────────────────────────────────────────
 
     def _record_chunk(self) -> Path | None:
-        """Capture WAKE_CHUNK_SECONDS of audio and return path to .wav file."""
+        """Capture WAKE_CHUNK_SECONDS of audio; return path to .wav."""
         try:
-            stream = self._pa.open(
-                format=pyaudio.paInt16,
+            frames = sd.rec(
+                int(SAMPLE_RATE * WAKE_CHUNK_SECONDS),
+                samplerate=SAMPLE_RATE,
                 channels=CHANNELS,
-                rate=SAMPLE_RATE,
-                input=True,
-                input_device_index=self._dev_idx,
-                frames_per_buffer=512,
+                dtype="int16",
+                device=self._dev,
+                blocking=True,
             )
-            total_frames = int(SAMPLE_RATE / 512 * WAKE_CHUNK_SECONDS)
-            frames = []
-            for _ in range(total_frames):
-                if not self.running:
-                    break
-                frames.append(stream.read(512, exception_on_overflow=False))
-            stream.stop_stream()
-            stream.close()
-
-            wav_path = self._tmp / f"ww_{int(time.time()*1000)}.wav"
-            with wave.open(str(wav_path), "wb") as wf:
+            wav = self._tmp / f"ww_{int(time.time()*1000)}.wav"
+            with wave.open(str(wav), "wb") as wf:
                 wf.setnchannels(CHANNELS)
-                wf.setsampwidth(self._pa.get_sample_size(pyaudio.paInt16))
+                wf.setsampwidth(2)          # int16 = 2 bytes
                 wf.setframerate(SAMPLE_RATE)
-                wf.writeframes(b"".join(frames))
-            return wav_path
+                wf.writeframes(frames.tobytes())
+            return wav
         except Exception as e:
             print(f"⚠️  Wake chunk record error: {e}")
             return None
 
+    # ── whisper ───────────────────────────────────────────────────────────────
+
     def _transcribe(self, wav: Path) -> str:
-        """Run Whisper on wav; return lowercase transcript."""
         txt = wav.with_suffix(".txt")
         try:
             subprocess.run(
@@ -102,7 +96,7 @@ class WakeWordDetector:
                     WHISPER_PATH, "-m", WHISPER_MODEL,
                     "-f", str(wav),
                     "--no-timestamps", "--output-txt",
-                    "-t", "2",       # 2 threads — light touch on Pi
+                    "-t", "2",
                     "--language", "en",
                 ],
                 capture_output=True,
@@ -121,26 +115,30 @@ class WakeWordDetector:
             txt.unlink(missing_ok=True)
         return ""
 
+    # ── wake word check ───────────────────────────────────────────────────────
+
     @staticmethod
     def _has_wake_word(text: str) -> bool:
         return any(v in text for v in WAKE_WORD_VARIATIONS)
+
+    # ── main loop ─────────────────────────────────────────────────────────────
 
     def _loop(self):
         print("👂 Wake-word loop running …")
         errors = 0
         while self.running:
             try:
-                wav  = self._record_chunk()
+                wav = self._record_chunk()
                 if wav and self.running:
                     text = self._transcribe(wav)
                     if text:
                         print(f"   heard: {text!r}")
                     if text and self._has_wake_word(text):
-                        print(f"✅ Wake word detected!")
+                        print("✅ Wake word detected!")
                         if self.callback:
                             t = threading.Thread(target=self.callback, daemon=True)
                             t.start()
-                            t.join()           # pause detection while responding
+                            t.join()    # pause detection while Rocky responds
                 errors = 0
             except Exception as e:
                 errors += 1
@@ -151,12 +149,12 @@ class WakeWordDetector:
                     errors = 0
         print("🛑 Wake-word loop stopped")
 
-    # ── Public API ────────────────────────────────────────────────────────────
+    # ── public API ────────────────────────────────────────────────────────────
 
     def start(self):
         if not self.running:
-            self.running  = True
-            self._thread  = threading.Thread(target=self._loop, daemon=True)
+            self.running = True
+            self._thread = threading.Thread(target=self._loop, daemon=True)
             self._thread.start()
             print("✅ Wake-word detection started")
 
@@ -164,8 +162,6 @@ class WakeWordDetector:
         self.running = False
         if self._thread:
             self._thread.join(timeout=8)
-        self._pa.terminate()
-        # Clean temp dir
         for f in self._tmp.glob("*.wav"):
             f.unlink(missing_ok=True)
         for f in self._tmp.glob("*.txt"):
@@ -173,7 +169,7 @@ class WakeWordDetector:
         print("✅ Wake-word detector stopped")
 
 
-# ── Standalone test ───────────────────────────────────────────────────────────
+# ── standalone test ───────────────────────────────────────────────────────────
 if __name__ == "__main__":
     def _cb():
         print("\n🎉 CALLBACK FIRED!\n")

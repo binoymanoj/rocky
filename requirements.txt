@@ -5,3 +5,4 @@ soundfile
 numpy
 piper-tts
 rich
+# pyaudio intentionally removed — causes segfault on Pi 5 with PipeWire

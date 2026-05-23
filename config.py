@@ -1,7 +1,7 @@
 # ─── Audio ────────────────────────────────────────────────────────────────────
-MIC_DEVICE = "plughw:0,0"   # Update from: arecord -l
-SAMPLE_RATE = 16000          # Whisper.cpp requires 16 kHz
-CHANNELS    = 1              # Mono
+MIC_DEVICE  = None      # None = auto-detect; or set to device index from: python3 -m sounddevice
+SAMPLE_RATE = 16000     # Whisper.cpp requires 16 kHz — do not change
+CHANNELS    = 1         # Mono
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
 WHISPER_PATH  = "/home/zoro/Applications/whisper.cpp/build/bin/main"
@@ -17,7 +17,7 @@ OLLAMA_MODEL = "gemma3:4b"
 OLLAMA_URL   = "http://localhost:11434"
 OLLAMA_SYSTEM_PROMPT = (
     "You are Rocky, a friendly and concise AI assistant running on a Raspberry Pi. "
-    "Keep every reply to 1–3 short sentences. Be warm and helpful."
+    "Keep every reply to 1-3 short sentences. Be warm and helpful."
 )
 
 # ─── Wake Word ────────────────────────────────────────────────────────────────
@@ -28,13 +28,13 @@ WAKE_WORD_VARIATIONS = [
 ]
 
 # ─── Recording ────────────────────────────────────────────────────────────────
-RECORD_SECONDS      = 6     # How long to record after wake word
-WAKE_CHUNK_SECONDS  = 3     # Audio chunk length for wake-word loop
+RECORD_SECONDS     = 6    # how long to record after wake word
+WAKE_CHUNK_SECONDS = 3    # audio chunk length for wake-word loop
 
 # ─── Display ──────────────────────────────────────────────────────────────────
 DISPLAY_WIDTH  = 480
 DISPLAY_HEIGHT = 320
-TARGET_FPS     = 20         # Lower = less CPU
+TARGET_FPS     = 20
 
 # ─── Misc ─────────────────────────────────────────────────────────────────────
-MAX_SAVED_AUDIO = 10        # How many wav files to keep per directory
+MAX_SAVED_AUDIO = 10
