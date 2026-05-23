@@ -142,58 +142,62 @@ class RockyAI:
 
     def _transcribe(self, audio_file: str) -> str | None:
         """
-        Run whisper.cpp in a child process with a timeout and clean crash handling.
-        Uses POSIX preexec_fn to ensure the child dies if it segfaults without
-        leaving zombie threads.
+        Whisper writes <stem>.txt wherever it feels like unless we pass
+        --output-file explicitly.  Without it the .txt lands in cwd, not
+        next to the wav.  Always pass --output-file <stem> so the path
+        is predictable regardless of working directory.
         """
-        txt = audio_file.replace(".wav", ".txt")
-        print(f"🧠 Transcribing {audio_file} …")
+        wav      = Path(audio_file)
+        out_stem = str(wav.with_suffix(""))   # recordings/rec_TIMESTAMP
+        txt      = wav.with_suffix(".txt")    # recordings/rec_TIMESTAMP.txt
+
+        print(f"🧠 Transcribing {wav.name} …")
         try:
             proc = subprocess.Popen(
                 [
                     WHISPER_PATH, "-m", WHISPER_MODEL,
-                    "-f", audio_file,
-                    "--no-timestamps", "--output-txt",
+                    "-f", str(wav),
+                    "--no-timestamps",
+                    "--output-txt",
+                    "--output-file", out_stem,   # ← explicit: fixes the missing txt bug
                     "-t", "2",
                     "--language", "en",
                 ],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                # Detach from our process group so a segfault doesn't kill us
-                start_new_session=True,
+                start_new_session=True,          # child segfault won't kill Python
             )
             try:
-                stdout, stderr = proc.communicate(timeout=25)
+                _, stderr = proc.communicate(timeout=25)
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.communicate()
                 print("⚠️  Whisper timed out — skipping")
                 return None
 
-            if proc.returncode not in (0, -11):  # -11 = SIGSEGV
-                print(f"⚠️  Whisper exited {proc.returncode}")
-                if stderr:
-                    print(f"   stderr: {stderr.decode(errors='replace')[:200]}")
-
             if proc.returncode == -11:
-                print("❌ Whisper segfaulted — rebuild with: cd ~/Applications/whisper.cpp && cmake -B build && cmake --build build -j$(nproc)")
+                print("❌ Whisper segfaulted — rebuild:")
+                print("   cd ~/Applications/whisper.cpp")
+                print("   cmake -B build -DGGML_NATIVE=OFF && cmake --build build -j$(nproc)")
                 return None
 
-            if os.path.exists(txt):
-                result = Path(txt).read_text().strip()
-                Path(txt).unlink(missing_ok=True)
+            if proc.returncode != 0:
+                print(f"⚠️  Whisper exited {proc.returncode}: {stderr.decode(errors='replace')[:200]}")
+
+            if txt.exists():
+                result = txt.read_text().strip()
+                txt.unlink(missing_ok=True)
+                print(f"📄 Heard: {result!r}")
                 return result or None
+
+            print(f"⚠️  Whisper ran (rc={proc.returncode}) but no .txt found at {txt}")
 
         except FileNotFoundError:
             print(f"❌ Whisper binary not found: {WHISPER_PATH}")
         except Exception as e:
             print(f"❌ Transcription error: {e}")
         finally:
-            # Clean up wav + txt regardless
-            try:
-                Path(txt).unlink(missing_ok=True)
-            except Exception:
-                pass
+            txt.unlink(missing_ok=True)
         return None
 
     # ── Ollama LLM ────────────────────────────────────────────────────────────
