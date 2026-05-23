@@ -5,7 +5,7 @@ SAMPLE_RATE  = 16000    # Target rate for Whisper — code will resample if mic 
 CHANNELS     = 1        # Mono
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
-WHISPER_PATH  = "/home/zoro/Applications/whisper.cpp/build/bin/main"
+WHISPER_PATH  = "/home/zoro/Applications/whisper.cpp/build/bin/whisper_cli"
 WHISPER_MODEL = "/home/zoro/Applications/whisper.cpp/models/ggml-base.en.bin"
 PIPER_VOICE   = "/home/zoro/rocky/voices/en_US-arctic-medium.onnx"
 
