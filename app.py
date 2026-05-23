@@ -7,11 +7,6 @@ Controls:
   Press Enter          → manual voice recording trigger
   Type text + Enter    → skip recording, send text straight to LLM
   Ctrl-C               → quit
-
-Startup behaviour:
-  - Model is warmed up immediately on launch (keep_alive = -1 = never unload)
-  - Display shows IDLE face right away
-  - Wake word loop starts immediately — no need to press Enter
 """
 
 import os
@@ -27,7 +22,7 @@ import requests
 from config import (
     CHANNELS, SAMPLE_RATE, RECORDINGS_DIR, RESPONSES_DIR,
     WHISPER_PATH, WHISPER_MODEL, PIPER_VOICE,
-    OLLAMA_MODEL, OLLAMA_URL, OLLAMA_SYSTEM_PROMPT, OLLAMA_KEEP_ALIVE,
+    OLLAMA_MODEL, OLLAMA_URL, OLLAMA_SYSTEM_PROMPT,
     WAKE_WORD, RECORD_SECONDS, MAX_SAVED_AUDIO,
 )
 from audio_utils import pick_input_device, get_native_rate, record_seconds, save_wav
@@ -40,11 +35,9 @@ class RockyAI:
         self.running           = False
         self._interaction_lock = threading.Lock()
 
-        # Shared audio device
         self._dev         = pick_input_device()
         self._native_rate = get_native_rate(self._dev)
 
-        # Sub-systems
         self.display       = FaceDisplay()
         self.wake_detector = WakeWordDetector(callback=self._on_wake_word)
 
@@ -73,7 +66,7 @@ class RockyAI:
             r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=3)
             models = [m["name"] for m in r.json().get("models", [])]
             if not any(OLLAMA_MODEL in m for m in models):
-                print(f"⚠️  Model '{OLLAMA_MODEL}' not pulled yet. Run: ollama pull {OLLAMA_MODEL}")
+                print(f"⚠️  Model '{OLLAMA_MODEL}' not pulled. Run: ollama pull {OLLAMA_MODEL}")
         except Exception:
             print(f"⚠️  Ollama not reachable at {OLLAMA_URL} — start with: ollama serve")
 
@@ -81,31 +74,48 @@ class RockyAI:
 
     def _warmup_model(self):
         """
-        Send a tiny dummy request so Ollama loads the model into RAM now,
-        not on the first real question.  Uses keep_alive=-1 so it stays loaded.
+        Ping Ollama with a 1-token request so the model is loaded into RAM
+        before the first real question.  Tries keep_alive as int, then string,
+        then without it — works across all Ollama versions.
         """
         print("🔥 Warming up LLM model …")
         self.display.set_emotion(EmotionState.LOADING)
-        try:
-            resp = requests.post(
-                f"{OLLAMA_URL}/api/chat",
-                json={
-                    "model": OLLAMA_MODEL,
-                    "stream": False,
-                    "keep_alive": OLLAMA_KEEP_ALIVE,
-                    "messages": [{"role": "user", "content": "hi"}],
-                    "options": {"num_predict": 1},
-                },
-                timeout=120,
-            )
-            if resp.status_code == 200:
-                print("✅ Model loaded and warm — ready!")
-            else:
-                print(f"⚠️  Warmup got HTTP {resp.status_code}")
-        except Exception as e:
-            print(f"⚠️  Warmup failed: {e}")
-        finally:
-            self.display.set_emotion(EmotionState.IDLE)
+
+        base_payload = {
+            "model": OLLAMA_MODEL,
+            "stream": False,
+            "messages": [{"role": "user", "content": "hi"}],
+            "options": {"num_predict": 1},
+        }
+
+        # Try keep_alive variants so the model stays in RAM permanently
+        for keep_alive_val in (-1, "-1", "60m", None):
+            payload = dict(base_payload)
+            if keep_alive_val is not None:
+                payload["keep_alive"] = keep_alive_val
+            try:
+                r = requests.post(
+                    f"{OLLAMA_URL}/api/chat",
+                    json=payload,
+                    timeout=120,
+                )
+                if r.status_code == 200:
+                    ka_str = f" (keep_alive={keep_alive_val!r})" if keep_alive_val is not None else ""
+                    print(f"✅ Model warm and loaded{ka_str}")
+                    # Store the working keep_alive value for later calls
+                    self._keep_alive = keep_alive_val
+                    self.display.set_emotion(EmotionState.IDLE)
+                    return
+                else:
+                    # 400 = bad payload, try next variant
+                    continue
+            except Exception as e:
+                print(f"⚠️  Warmup attempt failed: {e}")
+                break
+
+        print("⚠️  Model warmup failed — will load on first question (slower first response)")
+        self._keep_alive = None
+        self.display.set_emotion(EmotionState.IDLE)
 
     # ── wake-word callback ────────────────────────────────────────────────────
 
@@ -136,15 +146,12 @@ class RockyAI:
 
             print(f"📝 You: {text}")
 
-            hint = self._detect_emotion(text)
             self.display.set_emotion(EmotionState.THINKING)
             response = self._llm(text)
             if not response:
                 response = "Sorry, I'm having trouble thinking right now."
 
             print(f"💭 Rocky: {response}")
-
-            # Set speaking emotion and trigger mouth animation
             self.display.set_emotion(EmotionState.SPEAKING)
             self._speak(response)
 
@@ -194,13 +201,12 @@ class RockyAI:
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.communicate()
-                print("⚠️  Whisper timed out — skipping")
+                print("⚠️  Whisper timed out")
                 return None
 
             if proc.returncode == -11:
                 print("❌ Whisper segfaulted — rebuild with -DGGML_NATIVE=OFF")
                 return None
-
             if proc.returncode != 0:
                 print(f"⚠️  Whisper exited {proc.returncode}: {stderr.decode(errors='replace')[:200]}")
 
@@ -226,20 +232,20 @@ class RockyAI:
         payload = {
             "model": OLLAMA_MODEL,
             "stream": True,
-            "keep_alive": OLLAMA_KEEP_ALIVE,   # never unload between calls
             "messages": [
                 {"role": "system", "content": OLLAMA_SYSTEM_PROMPT},
                 {"role": "user",   "content": user_text},
             ],
             "options": {"temperature": 0.7, "num_predict": 120},
         }
-
-        # Speaking mouth animation while streaming (0fps screens get a toggle per token batch)
-        mouth_toggle = [False]
+        # Add keep_alive only if warmup found a working value
+        if hasattr(self, "_keep_alive") and self._keep_alive is not None:
+            payload["keep_alive"] = self._keep_alive
 
         for attempt in range(2):
             try:
                 tokens = []
+                tok_count = 0
                 with requests.post(
                     f"{OLLAMA_URL}/api/chat",
                     json=payload,
@@ -247,19 +253,29 @@ class RockyAI:
                     timeout=(10, 90),
                 ) as resp:
                     if resp.status_code != 200:
-                        print(f"❌ Ollama HTTP {resp.status_code}")
+                        body = resp.text[:300]
+                        print(f"❌ Ollama HTTP {resp.status_code}: {body}")
+                        # If keep_alive caused a 400, drop it and retry
+                        if resp.status_code == 400 and "keep_alive" in payload:
+                            print("   Retrying without keep_alive …")
+                            del payload["keep_alive"]
+                            self._keep_alive = None
+                            continue
                         return None
+
                     for line in resp.iter_lines():
                         if not line:
                             continue
                         chunk = json.loads(line)
                         tok = chunk["message"]["content"]
                         tokens.append(tok)
-                        # Toggle mouth open/close every ~5 tokens for 0fps screens
-                        if len(tokens) % 5 == 0:
+                        tok_count += 1
+                        # Toggle mouth on 0fps screen every 5 tokens
+                        if tok_count % 5 == 0:
                             self.display.set_emotion(EmotionState.SPEAKING)
                         if chunk.get("done"):
                             break
+
                 return "".join(tokens).strip() or None
 
             except requests.exceptions.ConnectionError:
@@ -289,9 +305,12 @@ class RockyAI:
                 print(f"⚠️  Piper error: {proc.stderr.decode()[:300]}")
                 return
 
-            # Play and animate mouth: toggle open/closed every 0.4 s
-            play = subprocess.Popen(["aplay", path], stdout=subprocess.DEVNULL,
-                                    stderr=subprocess.DEVNULL)
+            # Animate mouth open/close while audio plays
+            play = subprocess.Popen(
+                ["aplay", path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
             while play.poll() is None:
                 self.display.set_emotion(EmotionState.SPEAKING)
                 time.sleep(0.4)
@@ -302,23 +321,6 @@ class RockyAI:
             print(f"❌ TTS error: {e}")
         finally:
             self._prune(RESPONSES_DIR)
-
-    # ── emotion hint ──────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _detect_emotion(text: str):
-        t = text.lower()
-        if any(w in t for w in ("sad", "cry", "upset", "depressed", "miss", "alone")):
-            return EmotionState.SAD
-        if any(w in t for w in ("angry", "mad", "furious", "hate", "annoying")):
-            return EmotionState.ANGRY
-        if any(w in t for w in ("happy", "great", "awesome", "love", "wonderful", "yay")):
-            return EmotionState.HAPPY
-        if any(w in t for w in ("wow", "amazing", "incredible", "surprised", "whoa")):
-            return EmotionState.SURPRISED
-        if any(w in t for w in ("scared", "afraid", "fear", "terrified", "horror")):
-            return EmotionState.SCARED
-        return None
 
     # ── housekeeping ──────────────────────────────────────────────────────────
 
@@ -353,6 +355,7 @@ class RockyAI:
 
     def run(self):
         self.running = True
+        self._keep_alive = None   # set by _warmup_model
 
         print("\n" + "═" * 54)
         print("🤖  Rocky AI Buddy is running!")
@@ -362,13 +365,8 @@ class RockyAI:
         print("    Ctrl-C to quit")
         print("═" * 54 + "\n")
 
-        # Start display first (shows IDLE face immediately)
         threading.Thread(target=self.display.run, daemon=True).start()
-
-        # Warm up model in background so first response is fast
         threading.Thread(target=self._warmup_model, daemon=True).start()
-
-        # Start wake word and keyboard
         self.wake_detector.start()
         threading.Thread(target=self._keyboard_loop, daemon=True).start()
 
