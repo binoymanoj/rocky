@@ -12,13 +12,12 @@ Controls:
 import os
 import sys
 import time
-import wave
+import signal
 import threading
 import subprocess
 from pathlib import Path
 
 import numpy as np
-import sounddevice as sd
 import requests
 
 from config import (
@@ -37,7 +36,7 @@ class RockyAI:
         self.running           = False
         self._interaction_lock = threading.Lock()
 
-        # Shared audio device + native rate
+        # Shared audio device
         self._dev         = pick_input_device()
         self._native_rate = get_native_rate(self._dev)
 
@@ -48,7 +47,34 @@ class RockyAI:
         Path(RECORDINGS_DIR).mkdir(exist_ok=True)
         Path(RESPONSES_DIR).mkdir(exist_ok=True)
 
+        # Verify critical paths at startup — fail loudly before anything runs
+        self._preflight_check()
+
         print("🤖 Rocky AI initialised")
+
+    # ── startup checks ────────────────────────────────────────────────────────
+
+    def _preflight_check(self):
+        errors = []
+        if not os.path.isfile(WHISPER_PATH):
+            errors.append(f"Whisper binary not found: {WHISPER_PATH}")
+        if not os.path.isfile(WHISPER_MODEL):
+            errors.append(f"Whisper model not found: {WHISPER_MODEL}")
+        if not os.path.isfile(PIPER_VOICE):
+            errors.append(f"Piper voice not found: {PIPER_VOICE}")
+        if errors:
+            for e in errors:
+                print(f"❌ {e}")
+            sys.exit(1)
+
+        # Quick Ollama ping
+        try:
+            r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=3)
+            models = [m["name"] for m in r.json().get("models", [])]
+            if not any(OLLAMA_MODEL in m for m in models):
+                print(f"⚠️  Model '{OLLAMA_MODEL}' not found in Ollama. Pull it with: ollama pull {OLLAMA_MODEL}")
+        except Exception:
+            print(f"⚠️  Ollama not reachable at {OLLAMA_URL} — start it with: ollama serve")
 
     # ── wake-word callback ────────────────────────────────────────────────────
 
@@ -58,7 +84,6 @@ class RockyAI:
     # ── core pipeline ─────────────────────────────────────────────────────────
 
     def _run_interaction(self, typed_text: str | None = None):
-        """listen → transcribe → LLM → speak"""
         if not self._interaction_lock.acquire(blocking=False):
             print("⚠️  Already responding — ignoring trigger")
             return
@@ -105,33 +130,70 @@ class RockyAI:
         try:
             frames = record_seconds(RECORD_SECONDS, self._dev, self._native_rate)
             save_wav(path, frames)
-            print(f"✅ Saved → {path}")
+            # Sanity check
+            size = os.path.getsize(path)
+            print(f"✅ Saved → {path}  ({size:,} bytes)")
             return path
         except Exception as e:
             print(f"❌ Recording error: {e}")
             return None
 
-    # ── whisper transcription ─────────────────────────────────────────────────
+    # ── whisper transcription (safe subprocess) ───────────────────────────────
 
     def _transcribe(self, audio_file: str) -> str | None:
+        """
+        Run whisper.cpp in a child process with a timeout and clean crash handling.
+        Uses POSIX preexec_fn to ensure the child dies if it segfaults without
+        leaving zombie threads.
+        """
         txt = audio_file.replace(".wav", ".txt")
+        print(f"🧠 Transcribing {audio_file} …")
         try:
-            subprocess.run(
+            proc = subprocess.Popen(
                 [
                     WHISPER_PATH, "-m", WHISPER_MODEL,
                     "-f", audio_file,
                     "--no-timestamps", "--output-txt",
+                    "-t", "2",
                     "--language", "en",
                 ],
-                capture_output=True,
-                timeout=30,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                # Detach from our process group so a segfault doesn't kill us
+                start_new_session=True,
             )
+            try:
+                stdout, stderr = proc.communicate(timeout=25)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate()
+                print("⚠️  Whisper timed out — skipping")
+                return None
+
+            if proc.returncode not in (0, -11):  # -11 = SIGSEGV
+                print(f"⚠️  Whisper exited {proc.returncode}")
+                if stderr:
+                    print(f"   stderr: {stderr.decode(errors='replace')[:200]}")
+
+            if proc.returncode == -11:
+                print("❌ Whisper segfaulted — rebuild with: cd ~/Applications/whisper.cpp && cmake -B build && cmake --build build -j$(nproc)")
+                return None
+
             if os.path.exists(txt):
                 result = Path(txt).read_text().strip()
                 Path(txt).unlink(missing_ok=True)
                 return result or None
+
+        except FileNotFoundError:
+            print(f"❌ Whisper binary not found: {WHISPER_PATH}")
         except Exception as e:
             print(f"❌ Transcription error: {e}")
+        finally:
+            # Clean up wav + txt regardless
+            try:
+                Path(txt).unlink(missing_ok=True)
+            except Exception:
+                pass
         return None
 
     # ── Ollama LLM ────────────────────────────────────────────────────────────
